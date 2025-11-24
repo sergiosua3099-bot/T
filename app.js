@@ -25,7 +25,7 @@ cloudinary.config({
 
 // =============== HELPERS ===================
 
-// Mensaje que se muestra en la página de resultado IA
+// Mensaje personalizado para el usuario
 function generarMensajePersonalizado(productName, idea) {
   let base = `La elección de ${productName} encaja muy bien con el estilo de tu espacio. `;
 
@@ -33,7 +33,8 @@ function generarMensajePersonalizado(productName, idea) {
     base += `Tu idea de “${idea.trim()}” aporta un toque muy personal a la composición. `;
   }
 
-  base += "Preparamos esta visualización para que puedas tomar una decisión con total seguridad, viendo cómo se transforma tu ambiente antes de comprar.";
+  base +=
+    "Preparamos esta visualización para que puedas tomar una decisión con total seguridad, viendo cómo se transforma tu ambiente antes de comprar.";
 
   return base;
 }
@@ -67,14 +68,17 @@ async function llamarShopifyProducts() {
     }
   `;
 
-  const resp = await fetch(`https://${shopDomain}/api/2024-01/graphql.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Storefront-Access-Token": token
-    },
-    body: JSON.stringify({ query })
-  });
+  const resp = await fetch(
+    `https://${shopDomain}/api/2024-01/graphql.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Storefront-Access-Token": token
+      },
+      body: JSON.stringify({ query })
+    }
+  );
 
   if (!resp.ok) {
     const text = await resp.text();
@@ -84,7 +88,7 @@ async function llamarShopifyProducts() {
   const data = await resp.json();
 
   return data.data.products.edges.map((e) => ({
-    id: e.node.id,               // id GraphQL
+    id: e.node.id,
     title: e.node.title,
     handle: e.node.handle,
     description: e.node.description,
@@ -94,61 +98,56 @@ async function llamarShopifyProducts() {
   }));
 }
 
-// Llamar a Replicate SDXL (image-to-image) para generar la propuesta IA
+// =============== REPLICATE SDXL ===============
+
 async function llamarReplicateImagen(roomImageUrl, productName, idea) {
   const token = process.env.REPLICATE_API_TOKEN;
   if (!token) {
-    console.warn("REPLICATE_API_TOKEN no definido, devolviendo placeholder.");
+    console.warn("REPLICATE_API_TOKEN no definido.");
     return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   }
 
-  // Prompt muy enfocado a interiores + producto
   const prompt =
-    `Fotografía realista de interior, iluminación suave y cálida, estilo editorial premium. ` +
-    `Usa la foto proporcionada de la habitación como base y añade de forma natural el producto de decoración "${productName}" en una pared visible. ` +
+    `Realistic interior photograph. Keep the original room, walls, perspective, furniture, and lighting. ` +
+    `Integrate the decoration product "${productName}" naturally on a visible wall in the correct scale. ` +
     (idea && idea.trim().length > 0
-      ? `Ten en cuenta que el cliente pidió específicamente: ${idea.trim()}. `
-      : `Composición minimalista, equilibrada y acogedora, con el cuadro bien centrado y en proporción correcta. `) +
-    `Mantén la arquitectura, la perspectiva y los muebles originales de la habitación. Alta resolución, sin texto ni marcas de agua.`;
+      ? `Client request: ${idea.trim()}. `
+      : `Minimalist, balanced, warm and premium composition. `) +
+    `High resolution, elegant shadows, photorealistic. No text, no watermark.`;
 
-  const negativePrompt =
-    "low quality, blurry, distorted, deformed, extra limbs, bad anatomy, lowres, artifacts, ugly, oversaturated, cartoon, childish, unrealistic lighting";
+  const negative =
+    "low quality, blurry, distorted, deformed, ugly, artifacts, oversaturated, cartoon, unrealistic lighting";
 
   try {
-    // Usamos el endpoint oficial de modelo para no tener que poner version hash
-    // Docs: POST https://api.replicate.com/v1/models/stability-ai/sdxl/predictions
-    const resp = await fetch(
-      "https://api.replicate.com/v1/models/stability-ai/sdxl/predictions",
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Content-Type": "application/json",
-          "Prefer": "wait=60" // esperar hasta 60s para respuesta síncrona
-        },
-        body: JSON.stringify({
-          input: {
-            prompt,
-            negative_prompt: negativePrompt,
-            image: roomImageUrl,         // image-to-image usando la foto real del cliente
-            prompt_strength: 0.55,       // balance: respeta bastante la habitación
-            num_inference_steps: 28,
-            guidance_scale: 7,
-            output_format: "png"
-          }
-        })
-      }
-    );
+    const resp = await fetch("https://api.replicate.com/v1/predictions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "Prefer": "wait=60"
+      },
+      body: JSON.stringify({
+        version:
+          "8789987683457683f61606b3b2a9bc68d0f3f3b0bb5f74d6a7d8b4a03a0bdc54",
+        input: {
+          prompt,
+          negative_prompt: negative,
+          image: roomImageUrl,
+          prompt_strength: 0.6,
+          guidance_scale: 7,
+          num_inference_steps: 30
+        }
+      })
+    });
 
     if (!resp.ok) {
-      const t = await resp.text();
-      console.error("Error Replicate SDXL:", resp.status, t);
+      const txt = await resp.text();
+      console.error("Error Replicate SDXL:", resp.status, txt);
       return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
     }
 
     const prediction = await resp.json();
 
-    // Para modelos de imagen, Replicate suele devolver un array de URLs en prediction.output
     if (
       prediction &&
       prediction.output &&
@@ -158,21 +157,22 @@ async function llamarReplicateImagen(roomImageUrl, productName, idea) {
       return prediction.output[0];
     }
 
-    console.warn("Respuesta Replicate sin output válido:", prediction);
+    console.warn("Respuesta Replicate sin output:", prediction);
     return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   } catch (err) {
-    console.error("Excepción llamando a Replicate SDXL:", err);
+    console.error("Excepción Replicate SDXL:", err);
     return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   }
 }
 
 // =============== RUTAS ===================
 
+// Test
 app.get("/", (req, res) => {
   res.send("Innotiva Backend con Replicate SDXL funcionando ✅");
 });
 
-// Productos para el formulario en Shopify
+// Productos Shopify
 app.get("/productos-shopify", async (req, res) => {
   try {
     const products = await llamarShopifyProducts();
@@ -183,13 +183,7 @@ app.get("/productos-shopify", async (req, res) => {
   }
 });
 
-/**
- * Experiencia Premium:
- * - Recibe: roomImage (file), productId, productName, idea, productUrl (opcional)
- * - Sube la imagen del cliente a Cloudinary
- * - Genera propuesta IA con Replicate SDXL (image-to-image)
- * - Devuelve JSON que el front guarda en sessionStorage y muestra en /pages/resultado-ia
- */
+// Experiencia premium
 app.post(
   "/experiencia-premium",
   upload.single("roomImage"),
@@ -199,9 +193,10 @@ app.post(
       const file = req.file;
 
       if (!file) {
-        return res
-          .status(400)
-          .json({ success: false, error: "roomImage es obligatorio" });
+        return res.status(400).json({
+          success: false,
+          error: "roomImage es obligatorio"
+        });
       }
 
       if (!productId || !productName) {
@@ -211,7 +206,7 @@ app.post(
         });
       }
 
-      // 1) Subir imagen del cliente a Cloudinary
+      // Subir imagen del cliente
       const buffer = file.buffer;
       const userImageUrl = await new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
@@ -227,16 +222,13 @@ app.post(
         stream.end(buffer);
       });
 
-      // 2) Generar propuesta IA con SDXL (image-to-image) usando la foto del cliente
+      // Generar propuesta IA
       const generatedImageUrl = await llamarReplicateImagen(
         userImageUrl,
         productName,
         idea
       );
 
-      // 3) Resolver URL final del producto:
-      //    - Si viene productUrl desde el front, usamos esa
-      //    - Si no, construimos una URL de fallback usando el dominio y el id/handle
       const shopDomain = process.env.SHOPIFY_STORE_DOMAIN;
       let finalProductUrl = productUrl || null;
 
