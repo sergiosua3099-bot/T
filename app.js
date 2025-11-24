@@ -23,7 +23,8 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// Helpers
+// ========= HELPERS =========
+
 function generarMensajePersonalizado(productName, idea) {
   let base = `La elección de ${productName} encaja muy bien con el estilo de tu espacio. `;
 
@@ -36,6 +37,7 @@ function generarMensajePersonalizado(productName, idea) {
   return base;
 }
 
+// Traer productos desde Shopify Storefront API
 async function llamarShopifyProducts() {
   const shopDomain = process.env.SHOPIFY_STORE_DOMAIN;
   const token = process.env.SHOPIFY_STOREFRONT_TOKEN;
@@ -80,7 +82,7 @@ async function llamarShopifyProducts() {
 
   const data = await resp.json();
   return data.data.products.edges.map(e => ({
-    id: e.node.id,
+    id: e.node.id,               // id GraphQL
     title: e.node.title,
     handle: e.node.handle,
     description: e.node.description,
@@ -90,18 +92,21 @@ async function llamarShopifyProducts() {
   }));
 }
 
+// Generar imagen con OpenAI (dall-e-3, respuesta como URL)
 async function llamarOpenAIImagen(productName, idea) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     console.warn("OPENAI_API_KEY no definido, devolviendo placeholder.");
-    return "https://via.placeholder.com/500x300?text=Propuesta+IA";
+    return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   }
 
-  const prompt = `Visualiza el producto de decoración "${productName}" integrado de forma elegante en un espacio interior real. ${
-    idea && idea.trim().length > 0
-      ? "El cliente pidió específicamente: " + idea.trim() + "."
-      : "El estilo debe sentirse minimalista, cálido y acogedor."
-  } Render realista, iluminación suave, estilo fotografía editorial.`;
+  const prompt =
+    `Fotografía realista de interior, iluminación suave y cálida, estilo editorial premium. ` +
+    `Muestra un espacio decorado donde el protagonista es el producto de decoración "${productName}". ` +
+    (idea && idea.trim().length > 0
+      ? `Ten en cuenta que el cliente pidió específicamente: ${idea.trim()}. `
+      : `Composición equilibrada, minimalista, acogedora y sofisticada. `) +
+    `Alta resolución, detalles cuidados, sin texto ni marcas de agua.`;
 
   try {
     const resp = await fetch("https://api.openai.com/v1/images/generations", {
@@ -111,31 +116,34 @@ async function llamarOpenAIImagen(productName, idea) {
         "Authorization": `Bearer ${apiKey}`
       },
       body: JSON.stringify({
-        model: "gpt-image-1",
+        model: "dall-e-3",
         prompt,
-        size: "1024x1024"
+        n: 1,
+        size: "1024x1024",
+        response_format: "url"
       })
     });
 
     if (!resp.ok) {
       const t = await resp.text();
       console.error("Error OpenAI:", resp.status, t);
-      return "https://via.placeholder.com/500x300?text=Propuesta+IA";
+      return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
     }
 
     const data = await resp.json();
+
     if (data && data.data && data.data[0] && data.data[0].url) {
       return data.data[0].url;
     }
 
-    return "https://via.placeholder.com/500x300?text=Propuesta+IA";
+    return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   } catch (err) {
     console.error("Excepción OpenAI:", err);
-    return "https://via.placeholder.com/500x300?text=Propuesta+IA";
+    return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   }
 }
 
-// Rutas
+// ========= RUTAS =========
 
 app.get("/", (req, res) => {
   res.send("Innotiva Backend FULL OK");
@@ -152,10 +160,16 @@ app.get("/productos-shopify", async (req, res) => {
   }
 });
 
-// Experiencia premium: recibe foto + producto + idea, sube a Cloudinary, llama OpenAI, responde al front
+/**
+ * Experiencia premium:
+ * - Recibe: foto (roomImage), productId, productName, productUrl opcional, idea
+ * - Sube la foto del cliente a Cloudinary
+ * - Genera imagen IA con OpenAI
+ * - Devuelve JSON para que Shopify pinte el resultado
+ */
 app.post("/experiencia-premium", upload.single("roomImage"), async (req, res) => {
   try {
-    const { productId, productName, idea } = req.body;
+    const { productId, productName, idea, productUrl } = req.body;
     const file = req.file;
 
     if (!file) {
@@ -183,14 +197,20 @@ app.post("/experiencia-premium", upload.single("roomImage"), async (req, res) =>
       stream.end(buffer);
     });
 
-    // Llamar a OpenAI para generar propuesta IA
+    // Generar propuesta IA
     const generatedImageUrl = await llamarOpenAIImagen(productName, idea);
 
-    // Construir URL del producto en Shopify (usamos handle si lo pasas como productId)
+    // Resolver URL final del producto:
+    // 1) Si viene desde el front (productUrl), usamos esa directamente.
+    // 2) Si no viene, intentamos construirla con el dominio + /products/handle|id
     const shopDomain = process.env.SHOPIFY_STORE_DOMAIN;
-    let productUrl = null;
-    if (shopDomain) {
-      productUrl = `https://${shopDomain}/products/${productId}`;
+    let finalProductUrl = productUrl || null;
+
+    if (!finalProductUrl && shopDomain) {
+      // productId puede ser handle o id GraphQL. Si en el futuro envías el handle,
+      // esta URL quedará perfecta. Si es id y no existe URL, el front igual tendrá
+      // el enlace correcto por el campo "url" de Shopify.
+      finalProductUrl = `https://${shopDomain}/products/${productId}`;
     }
 
     const message = generarMensajePersonalizado(productName, idea);
@@ -200,7 +220,7 @@ app.post("/experiencia-premium", upload.single("roomImage"), async (req, res) =>
       message,
       userImageUrl,
       generatedImageUrl,
-      productUrl,
+      productUrl: finalProductUrl,
       productName
     });
   } catch (err) {
