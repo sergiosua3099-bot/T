@@ -16,15 +16,16 @@ app.use(express.urlencoded({ extended: true }));
 // Multer en memoria para recibir la imagen
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Config Cloudinary (desde .env)
+// =============== CONFIG CLOUDINARY ===================
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// ========= HELPERS =========
+// =============== HELPERS ===================
 
+// Mensaje que se muestra en la página de resultado IA
 function generarMensajePersonalizado(productName, idea) {
   let base = `La elección de ${productName} encaja muy bien con el estilo de tu espacio. `;
 
@@ -48,7 +49,7 @@ async function llamarShopifyProducts() {
 
   const query = `
     {
-      products(first: 20) {
+      products(first: 50) {
         edges {
           node {
             id
@@ -81,7 +82,8 @@ async function llamarShopifyProducts() {
   }
 
   const data = await resp.json();
-  return data.data.products.edges.map(e => ({
+
+  return data.data.products.edges.map((e) => ({
     id: e.node.id,               // id GraphQL
     title: e.node.title,
     handle: e.node.handle,
@@ -92,64 +94,85 @@ async function llamarShopifyProducts() {
   }));
 }
 
-// Generar imagen con OpenAI (dall-e-3, respuesta como URL)
-async function llamarOpenAIImagen(productName, idea) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    console.warn("OPENAI_API_KEY no definido, devolviendo placeholder.");
+// Llamar a Replicate SDXL (image-to-image) para generar la propuesta IA
+async function llamarReplicateImagen(roomImageUrl, productName, idea) {
+  const token = process.env.REPLICATE_API_TOKEN;
+  if (!token) {
+    console.warn("REPLICATE_API_TOKEN no definido, devolviendo placeholder.");
     return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   }
 
+  // Prompt muy enfocado a interiores + producto
   const prompt =
     `Fotografía realista de interior, iluminación suave y cálida, estilo editorial premium. ` +
-    `Muestra un espacio decorado donde el protagonista es el producto de decoración "${productName}". ` +
+    `Usa la foto proporcionada de la habitación como base y añade de forma natural el producto de decoración "${productName}" en una pared visible. ` +
     (idea && idea.trim().length > 0
       ? `Ten en cuenta que el cliente pidió específicamente: ${idea.trim()}. `
-      : `Composición equilibrada, minimalista, acogedora y sofisticada. `) +
-    `Alta resolución, detalles cuidados, sin texto ni marcas de agua.`;
+      : `Composición minimalista, equilibrada y acogedora, con el cuadro bien centrado y en proporción correcta. `) +
+    `Mantén la arquitectura, la perspectiva y los muebles originales de la habitación. Alta resolución, sin texto ni marcas de agua.`;
+
+  const negativePrompt =
+    "low quality, blurry, distorted, deformed, extra limbs, bad anatomy, lowres, artifacts, ugly, oversaturated, cartoon, childish, unrealistic lighting";
 
   try {
-    const resp = await fetch("https://api.openai.com/v1/images/generations", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: "dall-e-3",
-        prompt,
-        n: 1,
-        size: "1024x1024",
-        response_format: "url"
-      })
-    });
+    // Usamos el endpoint oficial de modelo para no tener que poner version hash
+    // Docs: POST https://api.replicate.com/v1/models/stability-ai/sdxl/predictions
+    const resp = await fetch(
+      "https://api.replicate.com/v1/models/stability-ai/sdxl/predictions",
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Prefer": "wait=60" // esperar hasta 60s para respuesta síncrona
+        },
+        body: JSON.stringify({
+          input: {
+            prompt,
+            negative_prompt: negativePrompt,
+            image: roomImageUrl,         // image-to-image usando la foto real del cliente
+            prompt_strength: 0.55,       // balance: respeta bastante la habitación
+            num_inference_steps: 28,
+            guidance_scale: 7,
+            output_format: "png"
+          }
+        })
+      }
+    );
 
     if (!resp.ok) {
       const t = await resp.text();
-      console.error("Error OpenAI:", resp.status, t);
+      console.error("Error Replicate SDXL:", resp.status, t);
       return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
     }
 
-    const data = await resp.json();
+    const prediction = await resp.json();
 
-    if (data && data.data && data.data[0] && data.data[0].url) {
-      return data.data[0].url;
+    // Para modelos de imagen, Replicate suele devolver un array de URLs en prediction.output
+    if (
+      prediction &&
+      prediction.output &&
+      Array.isArray(prediction.output) &&
+      prediction.output.length > 0
+    ) {
+      return prediction.output[0];
     }
 
+    console.warn("Respuesta Replicate sin output válido:", prediction);
     return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   } catch (err) {
-    console.error("Excepción OpenAI:", err);
+    console.error("Excepción llamando a Replicate SDXL:", err);
     return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   }
 }
 
-// ========= RUTAS =========
+// =============== RUTAS ===================
 
 app.get("/", (req, res) => {
-  res.send("Innotiva Backend FULL OK");
+  res.send("Innotiva Backend con Replicate SDXL funcionando ✅");
 });
 
-// Productos Shopify para el formulario
+// Productos para el formulario en Shopify
 app.get("/productos-shopify", async (req, res) => {
   try {
     const products = await llamarShopifyProducts();
@@ -161,77 +184,86 @@ app.get("/productos-shopify", async (req, res) => {
 });
 
 /**
- * Experiencia premium:
- * - Recibe: foto (roomImage), productId, productName, productUrl opcional, idea
- * - Sube la foto del cliente a Cloudinary
- * - Genera imagen IA con OpenAI
- * - Devuelve JSON para que Shopify pinte el resultado
+ * Experiencia Premium:
+ * - Recibe: roomImage (file), productId, productName, idea, productUrl (opcional)
+ * - Sube la imagen del cliente a Cloudinary
+ * - Genera propuesta IA con Replicate SDXL (image-to-image)
+ * - Devuelve JSON que el front guarda en sessionStorage y muestra en /pages/resultado-ia
  */
-app.post("/experiencia-premium", upload.single("roomImage"), async (req, res) => {
-  try {
-    const { productId, productName, idea, productUrl } = req.body;
-    const file = req.file;
+app.post(
+  "/experiencia-premium",
+  upload.single("roomImage"),
+  async (req, res) => {
+    try {
+      const { productId, productName, idea, productUrl } = req.body;
+      const file = req.file;
 
-    if (!file) {
-      return res.status(400).json({ success: false, error: "roomImage es obligatorio" });
-    }
+      if (!file) {
+        return res
+          .status(400)
+          .json({ success: false, error: "roomImage es obligatorio" });
+      }
 
-    if (!productId || !productName) {
-      return res.status(400).json({ success: false, error: "productId y productName son obligatorios" });
-    }
+      if (!productId || !productName) {
+        return res.status(400).json({
+          success: false,
+          error: "productId y productName son obligatorios"
+        });
+      }
 
-    // Subir imagen del cliente a Cloudinary
-    const buffer = file.buffer;
+      // 1) Subir imagen del cliente a Cloudinary
+      const buffer = file.buffer;
+      const userImageUrl = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            folder: "innotiva/rooms",
+            resource_type: "image"
+          },
+          (error, result) => {
+            if (error) return reject(error);
+            resolve(result.secure_url);
+          }
+        );
+        stream.end(buffer);
+      });
 
-    const userImageUrl = await new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        {
-          folder: "innotiva/rooms",
-          resource_type: "image"
-        },
-        (error, result) => {
-          if (error) return reject(error);
-          resolve(result.secure_url);
-        }
+      // 2) Generar propuesta IA con SDXL (image-to-image) usando la foto del cliente
+      const generatedImageUrl = await llamarReplicateImagen(
+        userImageUrl,
+        productName,
+        idea
       );
-      stream.end(buffer);
-    });
 
-    // Generar propuesta IA
-    const generatedImageUrl = await llamarOpenAIImagen(productName, idea);
+      // 3) Resolver URL final del producto:
+      //    - Si viene productUrl desde el front, usamos esa
+      //    - Si no, construimos una URL de fallback usando el dominio y el id/handle
+      const shopDomain = process.env.SHOPIFY_STORE_DOMAIN;
+      let finalProductUrl = productUrl || null;
 
-    // Resolver URL final del producto:
-    // 1) Si viene desde el front (productUrl), usamos esa directamente.
-    // 2) Si no viene, intentamos construirla con el dominio + /products/handle|id
-    const shopDomain = process.env.SHOPIFY_STORE_DOMAIN;
-    let finalProductUrl = productUrl || null;
+      if (!finalProductUrl && shopDomain) {
+        finalProductUrl = `https://${shopDomain}/products/${productId}`;
+      }
 
-    if (!finalProductUrl && shopDomain) {
-      // productId puede ser handle o id GraphQL. Si en el futuro envías el handle,
-      // esta URL quedará perfecta. Si es id y no existe URL, el front igual tendrá
-      // el enlace correcto por el campo "url" de Shopify.
-      finalProductUrl = `https://${shopDomain}/products/${productId}`;
+      const message = generarMensajePersonalizado(productName, idea);
+
+      return res.json({
+        success: true,
+        message,
+        userImageUrl,
+        generatedImageUrl,
+        productUrl: finalProductUrl,
+        productName
+      });
+    } catch (err) {
+      console.error("ERR /experiencia-premium:", err);
+      return res.status(500).json({
+        success: false,
+        error: "Error interno preparando la experiencia premium"
+      });
     }
-
-    const message = generarMensajePersonalizado(productName, idea);
-
-    return res.json({
-      success: true,
-      message,
-      userImageUrl,
-      generatedImageUrl,
-      productUrl: finalProductUrl,
-      productName
-    });
-  } catch (err) {
-    console.error("ERR /experiencia-premium:", err);
-    return res.status(500).json({
-      success: false,
-      error: "Error interno preparando la experiencia premium"
-    });
   }
-});
+);
 
 app.listen(port, () => {
-  console.log("Servidor Innotiva FULL escuchando en puerto", port);
+  console.log("Servidor Innotiva con Replicate SDXL escuchando en puerto", port);
 });
