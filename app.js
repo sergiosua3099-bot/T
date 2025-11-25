@@ -1,52 +1,87 @@
+// app.js
+// Backend Innotiva + Replicate SDXL (image-to-image)
+
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const fetch = require("node-fetch");
 const cloudinary = require("cloudinary").v2;
+const Replicate = require("replicate");
 require("dotenv").config();
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Middleware
+// ========= CONFIG GENERAL =========
+
+// Shopify
+const SHOPIFY_STORE_DOMAIN =
+  process.env.SHOPIFY_STORE_DOMAIN || "innotiva-vision.myshopify.com";
+const SHOPIFY_STOREFRONT_TOKEN =
+  process.env.SHOPIFY_STOREFRONT_TOKEN || process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN || "";
+
+// Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+// Replicate
+const replicate = new Replicate({
+  auth: process.env.REPLICATE_API_TOKEN,
+});
+
+// ========= MIDDLEWARE =========
+
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Multer en memoria para recibir la imagen
 const upload = multer({ storage: multer.memoryStorage() });
 
-// =============== CONFIG CLOUDINARY ===================
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET
-});
+// ========= HELPERS =========
 
-// =============== HELPERS ===================
+// Subir un buffer a Cloudinary y devolver secure_url
+function subirACloudinaryDesdeBuffer(buffer, folder, prefix) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: folder || "innotiva",
+        public_id: `${prefix || "img"}_${Date.now()}`,
+        resource_type: "image",
+      },
+      (err, result) => {
+        if (err) return reject(err);
+        return resolve(result.secure_url);
+      }
+    );
+    stream.end(buffer);
+  });
+}
 
-// Mensaje personalizado para el usuario
+// Mensaje para la página de resultado
 function generarMensajePersonalizado(productName, idea) {
   let base = `La elección de ${productName} encaja muy bien con el estilo de tu espacio. `;
 
   if (idea && idea.trim().length > 0) {
     base += `Tu idea de “${idea.trim()}” aporta un toque muy personal a la composición. `;
+  } else {
+    base += `Nos enfocamos en una composición equilibrada y minimalista para que el producto sea protagonista sin recargar el ambiente. `;
   }
 
   base +=
-    "Preparamos esta visualización para que puedas tomar una decisión con total seguridad, viendo cómo se transforma tu ambiente antes de comprar.";
-
+    "Esta visualización te ayuda a tomar decisiones con más confianza, viendo cómo se transforma tu espacio antes de comprar.";
   return base;
 }
 
-// Traer productos desde Shopify Storefront API
+// Obtener productos de Shopify para el formulario
 async function llamarShopifyProducts() {
-  const shopDomain = process.env.SHOPIFY_STORE_DOMAIN;
-  const token = process.env.SHOPIFY_STOREFRONT_TOKEN;
-
-  if (!shopDomain || !token) {
-    throw new Error("Faltan SHOPIFY_STORE_DOMAIN o SHOPIFY_STOREFRONT_TOKEN en .env");
+  if (!SHOPIFY_STOREFRONT_TOKEN) {
+    console.warn("No hay SHOPIFY_STOREFRONT_TOKEN definido, se intentará sin auth.");
   }
+
+  const endpoint = `https://${SHOPIFY_STORE_DOMAIN}/api/2024-01/graphql.json`;
 
   const query = `
     {
@@ -54,13 +89,17 @@ async function llamarShopifyProducts() {
         edges {
           node {
             id
-            title
             handle
+            title
             description
-            availableForSale
             onlineStoreUrl
-            featuredImage {
-              url
+            images(first: 1) {
+              edges {
+                node {
+                  url
+                  altText
+                }
+              }
             }
           }
         }
@@ -68,111 +107,118 @@ async function llamarShopifyProducts() {
     }
   `;
 
-  const resp = await fetch(
-    `https://${shopDomain}/api/2024-01/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Storefront-Access-Token": token
-      },
-      body: JSON.stringify({ query })
-    }
-  );
+  const headers = {
+    "Content-Type": "application/json",
+  };
+
+  if (SHOPIFY_STOREFRONT_TOKEN) {
+    headers["X-Shopify-Storefront-Access-Token"] = SHOPIFY_STOREFRONT_TOKEN;
+  }
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ query }),
+  });
 
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error("Error Shopify: " + resp.status + " " + text);
+    const txt = await resp.text();
+    console.error("Error Shopify:", resp.status, txt);
+    throw new Error("No se pudieron obtener los productos de Shopify");
   }
 
-  const data = await resp.json();
+  const json = await resp.json();
+  const edges = json?.data?.products?.edges || [];
 
-  return data.data.products.edges.map((e) => ({
-    id: e.node.id,
-    title: e.node.title,
-    handle: e.node.handle,
-    description: e.node.description,
-    available: e.node.availableForSale,
-    url: e.node.onlineStoreUrl,
-    image: e.node.featuredImage ? e.node.featuredImage.url : null
-  }));
+  const products = edges.map((edge) => {
+    const node = edge.node;
+    const imgEdge = node.images?.edges?.[0];
+    const img = imgEdge?.node;
+    const imageUrl =
+      img?.url || "https://via.placeholder.com/400x400?text=Producto";
+
+    const handle = node.handle;
+    const url =
+      node.onlineStoreUrl ||
+      `https://${SHOPIFY_STORE_DOMAIN}/products/${handle}`;
+
+    return {
+      id: handle, // usamos handle como id para el front
+      handle,
+      title: node.title,
+      description: node.description || "",
+      image: imageUrl,
+      url,
+    };
+  });
+
+  return products;
 }
 
-// =============== REPLICATE SDXL ===============
+// ========= REPLICATE SDXL (B) =========
 
 async function llamarReplicateImagen(roomImageUrl, productName, idea) {
-  const token = process.env.REPLICATE_API_TOKEN;
-  if (!token) {
-    console.warn("REPLICATE_API_TOKEN no definido.");
+  if (!process.env.REPLICATE_API_TOKEN) {
+    console.warn("REPLICATE_API_TOKEN no definido, devolviendo placeholder.");
     return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   }
 
+  // Prompt centrado en interior + producto + mantener habitación
   const prompt =
-    `Realistic interior photograph. Keep the original room, walls, perspective, furniture, and lighting. ` +
-    `Integrate the decoration product "${productName}" naturally on a visible wall in the correct scale. ` +
+    `Photorealistic interior photograph of the SAME room as the reference image. ` +
+    `Maintain the original walls, colors, furniture and perspective. ` +
+    `Add the decoration product "${productName}" on a visible wall in a natural, realistic way, with correct scale and alignment. ` +
     (idea && idea.trim().length > 0
-      ? `Client request: ${idea.trim()}. `
-      : `Minimalist, balanced, warm and premium composition. `) +
-    `High resolution, elegant shadows, photorealistic. No text, no watermark.`;
+      ? `Client request: "${idea.trim()}". Respect this composition as much as possible. `
+      : `Balanced, minimalistic and premium composition, centered around the product. `) +
+    `Soft warm lighting, 4k, high detail. No text, no watermark, no logo.`;
 
-  const negative =
-    "low quality, blurry, distorted, deformed, ugly, artifacts, oversaturated, cartoon, unrealistic lighting";
+  const negativePrompt =
+    "low quality, blurry, distorted, deformed, bad anatomy, wrong perspective, extra limbs, text, watermark, logo, oversaturated, cartoon";
 
   try {
-    const resp = await fetch("https://api.replicate.com/v1/predictions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json",
-        "Prefer": "wait=60"
-      },
-      body: JSON.stringify({
-        version:
-          "8789987683457683f61606b3b2a9bc68d0f3f3b0bb5f74d6a7d8b4a03a0bdc54",
+    const output = await replicate.run(
+      // Versión estable de SDXL recomendada en la doc oficial
+      // https://replicate.com/stability-ai/sdxl :contentReference[oaicite:1]{index=1}
+      "stability-ai/sdxl:39ed52f2a78e934b3ba6e2a89f5b1c712de7dfea535525255b1aa35c5565e08b",
+      {
         input: {
           prompt,
-          negative_prompt: negative,
-          image: roomImageUrl,
-          prompt_strength: 0.6,
-          guidance_scale: 7,
-          num_inference_steps: 30
-        }
-      })
-    });
+          negative_prompt: negativePrompt,
+          // img2img: usamos la imagen del cliente como referencia
+          image: roomImageUrl, // URL pública (Cloudinary)
+          strength: 0.55, // 0.0 = copia exacta, 1.0 = ignora la foto
+          num_inference_steps: 28,
+          guidance_scale: 7.5,
+          scheduler: "K_EULER",
+          refine: "expert_ensemble_refiner",
+          lora_scale: 0, // sin LoRA por ahora
+          num_outputs: 1,
+          // output_format por defecto URL
+        },
+      }
+    );
 
-    if (!resp.ok) {
-      const txt = await resp.text();
-      console.error("Error Replicate SDXL:", resp.status, txt);
-      return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
+    if (Array.isArray(output) && output.length > 0) {
+      return output[0];
     }
 
-    const prediction = await resp.json();
-
-    if (
-      prediction &&
-      prediction.output &&
-      Array.isArray(prediction.output) &&
-      prediction.output.length > 0
-    ) {
-      return prediction.output[0];
-    }
-
-    console.warn("Respuesta Replicate sin output:", prediction);
+    console.warn("Replicate devolvió output vacío:", output);
     return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   } catch (err) {
-    console.error("Excepción Replicate SDXL:", err);
+    console.error("Error llamando a Replicate SDXL:", err);
     return "https://via.placeholder.com/1024x1024?text=Propuesta+IA";
   }
 }
 
-// =============== RUTAS ===================
+// ========= RUTAS =========
 
-// Test
+// Healthcheck
 app.get("/", (req, res) => {
-  res.send("Innotiva Backend con Replicate SDXL funcionando ✅");
+  res.send("Innotiva Backend con Replicate SDXL (B) OK ✅");
 });
 
-// Productos Shopify
+// Productos para el formulario
 app.get("/productos-shopify", async (req, res) => {
   try {
     const products = await llamarShopifyProducts();
@@ -183,59 +229,50 @@ app.get("/productos-shopify", async (req, res) => {
   }
 });
 
-// Experiencia premium
+// Experiencia premium: foto + producto + idea
 app.post(
   "/experiencia-premium",
   upload.single("roomImage"),
   async (req, res) => {
     try {
-      const { productId, productName, idea, productUrl } = req.body;
-      const file = req.file;
-
-      if (!file) {
+      if (!req.file) {
         return res.status(400).json({
           success: false,
-          error: "roomImage es obligatorio"
+          error: "Falta la imagen del espacio (roomImage)",
         });
       }
+
+      const { productId, productName, idea, productUrl } = req.body;
 
       if (!productId || !productName) {
         return res.status(400).json({
           success: false,
-          error: "productId y productName son obligatorios"
+          error: "Faltan datos del producto (productId / productName)",
         });
       }
 
-      // Subir imagen del cliente
-      const buffer = file.buffer;
-      const userImageUrl = await new Promise((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          {
-            folder: "innotiva/rooms",
-            resource_type: "image"
-          },
-          (error, result) => {
-            if (error) return reject(error);
-            resolve(result.secure_url);
-          }
-        );
-        stream.end(buffer);
-      });
+      // 1) Subir la foto original del cliente a Cloudinary
+      const userImageUrl = await subirACloudinaryDesdeBuffer(
+        req.file.buffer,
+        "innotiva/rooms",
+        "room"
+      );
 
-      // Generar propuesta IA
+      // 2) Generar imagen IA con Replicate (img2img)
       const generatedImageUrl = await llamarReplicateImagen(
         userImageUrl,
         productName,
-        idea
+        idea || ""
       );
 
-      const shopDomain = process.env.SHOPIFY_STORE_DOMAIN;
+      // 3) Resolver URL final del producto
       let finalProductUrl = productUrl || null;
-
-      if (!finalProductUrl && shopDomain) {
-        finalProductUrl = `https://${shopDomain}/products/${productId}`;
+      if (!finalProductUrl) {
+        // productId lo estamos usando como handle (ver /productos-shopify)
+        finalProductUrl = `https://${SHOPIFY_STORE_DOMAIN}/products/${productId}`;
       }
 
+      // 4) Mensaje para la página de resultado
       const message = generarMensajePersonalizado(productName, idea);
 
       return res.json({
@@ -244,18 +281,22 @@ app.post(
         userImageUrl,
         generatedImageUrl,
         productUrl: finalProductUrl,
-        productName
+        productName,
       });
     } catch (err) {
       console.error("ERR /experiencia-premium:", err);
       return res.status(500).json({
         success: false,
-        error: "Error interno preparando la experiencia premium"
+        error: "Error interno preparando la experiencia premium",
       });
     }
   }
 );
 
+// ========= ARRANCAR SERVIDOR =========
+
 app.listen(port, () => {
-  console.log("Servidor Innotiva con Replicate SDXL escuchando en puerto", port);
+  console.log(
+    `Servidor Innotiva con Replicate SDXL (B) escuchando en puerto ${port}`
+  );
 });
